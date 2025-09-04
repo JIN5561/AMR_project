@@ -1,0 +1,293 @@
+MODULE Robot2_Classification
+    
+    VAR socketdev client_socket;
+    VAR string server_ip := "192.168.3.15";
+    CONST num server_port := 3000;
+    
+    VAR socketstatus client_status;
+    VAR string received_msg := "";
+    var bool black_full:=FALSE;
+    VAR bool white_full:=FALSE;
+    
+    PERS num nBlackTireCont{8} := [1,1,1,1,0,0,0,0];    
+    PERS num nBlackTireCount := 4;
+    PERS num nWhiteTireCont{8} := [1,1,1,1,0,0,0,0];    
+    PERS num nWhiteTireCount := 4;
+    
+    PERS num nCarCount := 0;  ! ?? ?? ??? ???? ??
+    
+    CONST robtarget p_home := [[300.38,-35.16,565.56],[0.00861505,-0.330592,-0.943725,0.00415648],[-1,-1,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_arrive := [[607.82,-14.58,131.35],[0.0086613,-0.330569,-0.943733,0.00417],[-1,-1,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_arrive_pass := [[340.82,-12.81,275.38],[0.0102992,-0.0444489,-0.998945,-0.00519309],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_cont_pass := [[356.37,379.55,566.49],[0.0101613,-0.0443919,-0.998949,-0.0052832],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_car_pass := [[-179.34,-412.70,537.32],[0.00881602,-0.330586,-0.943723,0.00461004],[-2,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_black_cont := [[393.20,-434.85,28.92],[0.0101716,-0.0443944,-0.998948,-0.00528389],[-1,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_black_one := [[423.28,-463.94,61.95],[0.010173,-0.0443923,-0.998948,-0.00528436],[-1,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_white_cont := [[246.97,-436.02,31.42],[0.0101564,-0.0444352,-0.998947,-0.00527949],[-1,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_white_one := [[277.71,-464.27,57.50],[0.0101431,-0.0444087,-0.998948,-0.00525535],[-1,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_cont_out := [[680.53,371.99,506.71],[0.0103007,-0.0444621,-0.998944,-0.00519285],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_car_in := [[302.73,382.89,129.56],[0.0087967,-0.329016,-0.94428,0.00244883],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_car_one := [[-326.80,-414.52,201.26],[0.00879435,-0.330604,-0.943717,0.00459609],[-2,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget p_car_two := [[-109.53,-414.49,194.34],[0.00881567,-0.330635,-0.943706,0.00457676],[-2,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    
+    
+    TASK PERS tooldata tool_one:=[TRUE,[[0,0,110],[1,0,0,0]],[0.2,[0,0,50],[1,0,0,0],0,0,0]];
+    
+    PROC grip_on()
+        PulseDO\PLength:=0.2, do00_grip_on;
+        WaitDI di00_grip_on_sen, 1;
+    ENDPROC
+    
+    PROC grip_off()
+        PulseDO\PLength:=0.2, do01_grip_off;
+        WaitDI di01_grip_off_sen, 1;
+    ENDPROC
+    
+    PROC start()
+        PulseDO\PLength:=0.2, do02_plcstart;
+    ENDPROC
+    
+    PROC stack_amr_white()
+        TPWrite "Starting AMR";
+        MoveJ Offs(p_white_cont,0,0,100), v100, z50, tool_one;
+        MoveJ Offs(p_white_cont,0,0,40), v50, fine, tool_one;
+        MoveL p_white_cont, v20, fine, tool_one;
+        grip_on;
+        MoveJ Offs(p_white_cont,0,0,100), v100, z100, tool_one;
+        MoveJ p_home, v100, z50, tool_one;
+        MoveJ p_cont_pass, v50, z100, tool_one;
+        MoveJ Offs(p_cont_out,0,0,30), v50, z100, tool_one;
+        MoveL p_cont_out, v20, fine, tool_one;
+        grip_off;
+        MoveJ Offs(p_cont_out,0,0,30), v50, z100, tool_one;
+        MoveJ p_cont_pass, v100, z50, tool_one;
+        MoveJ p_home, v200, z50, tool_one;
+    ENDPROC
+    
+    PROC stack_amr_black()
+        TPWrite "Starting AMR st";
+        MoveJ Offs(p_black_cont,0,0,100), v100, z50, tool_one;
+        MoveJ Offs(p_black_cont,0,0,40), v50, fine, tool_one;
+        MoveL p_black_cont, v20, fine, tool_one;
+        grip_on;
+        MoveJ Offs(p_black_cont,0,0,100), v100, z100, tool_one;
+        MoveJ p_home, v100, z50, tool_one;
+        MoveJ p_cont_pass, v50, z100, tool_one;
+        MoveJ Offs(p_cont_out,0,0,30), v50, z100, tool_one;
+        MoveL p_cont_out, v20, fine, tool_one;
+        grip_off;
+        MoveJ Offs(p_cont_out,0,0,30), v50, z100, tool_one;
+        MoveJ p_cont_pass, v100, z50, tool_one;
+        MoveJ p_home, v200, z50, tool_one;
+    ENDPROC
+    
+    PROC Store_Tire(string sColor)
+        VAR robtarget p_cont_slot;
+        VAR num empty_slot_index;
+        VAR num nTireCont{8};
+        VAR robtarget p_cont_base;
+        
+        IF sColor = "BLACK" THEN
+            nTireCont := nBlackTireCont;
+            p_cont_base := p_black_one;
+        ELSEIF sColor = "WHITE" THEN
+            nTireCont := nWhiteTireCont;
+            p_cont_base := p_white_one;
+        ENDIF
+        
+        IF nBlackTireCount >= 8 THEN
+             TPWrite "Black container is full. Cannot store more tires.";
+             black_full:=TRUE;
+        ENDIF
+
+        IF nWhiteTireCount >= 8 THEN
+             TPWrite "White container is full. Cannot store more tires.";
+            white_full:=TRUE;
+        ENDIF
+        
+        empty_slot_index := 0;
+        FOR i FROM 1 TO 8 DO
+            IF nTireCont{i} = 0 THEN
+                empty_slot_index := i;
+                GOTO empty;
+            ENDIF
+        ENDFOR
+        empty:
+        IF empty_slot_index > 0 THEN
+            
+            TEST empty_slot_index
+            CASE 1, 5: p_cont_slot := Offs(p_cont_base, 0, 0, 0);
+            CASE 2, 6: p_cont_slot := Offs(p_cont_base, 0, 60, 0);
+            CASE 3, 7: p_cont_slot := Offs(p_cont_base, -60, 0, 0);
+            CASE 4, 8: p_cont_slot := Offs(p_cont_base, -60, 60, 0);
+            ENDTEST
+            
+            TPWrite "Placing a " + sColor + " tire in slot " + ValToStr(empty_slot_index) + "...";
+            
+            MoveJ Offs(p_arrive,0,0,30), v400, z50, tool_one;
+            MoveL p_arrive, v20, fine, tool_one;
+            grip_on;
+            MoveJ Offs(p_arrive,0,0,30), v100, z50, tool_one;
+            MoveJ p_arrive_pass, v400, z50, tool_one;
+            MoveJ Offs(p_cont_slot,0,0,30), v300, z50, tool_one;
+            MoveL p_cont_slot, v20, fine, tool_one;
+            grip_off;
+            MoveJ Offs(p_cont_slot,0,0,30), v100, z50, tool_one;
+            MoveJ p_arrive_pass, v300, z50, tool_one;
+            
+        
+            nTireCont{empty_slot_index} := 1;
+            
+            IF sColor = "BLACK" THEN
+                nBlackTireCount := nBlackTireCount + 1;
+                nBlackTireCont := nTireCont;
+                TPWrite "Current black tire count: " + ValToStr(nBlackTireCount) + "/8";
+            ELSE
+                nWhiteTireCount := nWhiteTireCount + 1;
+                nWhiteTireCont := nTireCont;
+                TPWrite "Current white tire count: " + ValToStr(nWhiteTireCount) + "/8";
+            ENDIF
+        ELSE
+            TPWrite "ERROR: Could not find an empty slot for " + sColor + " tires. Check count.";
+        ENDIF
+    ENDPROC
+
+    PROC Store_Car1()
+        VAR robtarget p_car_place;
+        TPWrite "Storing car number 1...";
+        p_car_place := p_car_one;
+        
+        MoveJ Offs(p_car_in,0,0,60), v100, z50, tool_one;
+        MoveL p_car_in, v20, fine, tool_one;
+        grip_on;
+        MoveJ Offs(p_car_in,5,0,5), v100, z50, tool_one;
+        MoveJ Offs(p_car_in,5,0,60), v100, z50, tool_one;
+        MoveJ p_car_pass, v100, z50, tool_one;
+        MoveJ Offs(p_car_place,0,0,30), v50, z50, tool_one;
+        MoveL p_car_place, v20, fine, tool_one;
+        grip_off;
+        MoveJ Offs(p_car_place,0,0,30), v20, fine, tool_one;
+        MoveJ p_car_pass, v100, z50, tool_one;
+        
+        MoveJ p_home, v200, z50, tool_one;
+        
+        nCarCount := nCarCount + 1;
+        TPWrite "Car number " + ValToStr(nCarCount) + " stored.";
+    ENDPROC
+    
+    PROC Store_Car2()
+        VAR robtarget p_car_place;
+        TPWrite "Storing car number 2...";
+        p_car_place := p_car_two;
+        
+        MoveJ Offs(p_car_in,0,0,60), v100, z50, tool_one;
+        MoveL p_car_in, v20, fine, tool_one;
+        grip_on;
+        MoveJ Offs(p_car_in,5,0,5), v100, z50, tool_one;
+        MoveJ Offs(p_car_in,5,0,60), v100, z50, tool_one;
+        MoveJ p_car_pass, v100, z50, tool_one;
+        MoveJ Offs(p_car_place,0,0,30), v50, z50, tool_one;
+        MoveL p_car_place, v20, fine, tool_one;
+        grip_off;
+        MoveJ Offs(p_car_place,0,0,30), v20, fine, tool_one;
+        MoveJ p_car_pass, v100, z50, tool_one;
+        
+        MoveJ p_home, v200, z50, tool_one;
+        
+        
+        nCarCount := nCarCount + 1;
+        TPWrite "Car number " + ValToStr(nCarCount) + " stored.";
+    ENDPROC
+    
+    PROC client_init()
+        SocketCreate client_socket;
+        SocketConnect client_socket, server_ip, server_port;
+        TPWrite "Connected to server at " + server_ip + ":" + NumToStr(server_port, 0);
+        SocketSend client_socket \Str := "ROLE_ABB2";
+    ENDPROC
+    
+    PROC client_close()
+        SocketClose client_socket;
+        TPWrite "Client socket closed";
+    ENDPROC
+    
+    PROC main()
+        AccSet 1,1;
+        client_init;
+        MoveJ p_home, v200, z50, tool_one;
+        grip_off;
+        
+        WHILE TRUE DO
+            TPWrite "Waiting for signal from server...";
+            SocketReceive client_socket \Str := received_msg \Time := 99999;
+            TPWrite "Now messge : " + received_msg;
+            IF received_msg = "WHLSTRT" THEN
+                TPWrite "'whlstrt' signal received. Starting PLC process.";
+                WHILE (not white_full) AND (not black_full) DO
+                    start;
+                    waitdi di06_arrive,1;
+                    TPWrite "Container is not full. start classify";
+                    SocketReceive client_socket \Str := received_msg \Time := 99999;
+                    IF  received_msg = "BLACK" THEN
+                        TPWrite "Black tire signal received. Storing black tire.";
+                        Store_Tire "BLACK";
+                    ENDIF
+                    IF received_msg = "WHITE" THEN
+                        TPWrite "White tire signal received. Storing white tire.";
+                        Store_Tire "WHITE";
+                    ENDIF
+                    received_msg := ""; 
+                ENDWHILE
+            ENDIF
+
+
+            
+            IF received_msg = "car1_ready" THEN
+                TPWrite "AMR car arrived signal received. Storing car1.";
+                Store_Car1;
+                SocketSend client_socket \Str := "car1_comp";
+                SocketReceive client_socket \Str := received_msg \Time := 99999;
+                    IF received_msg = "car2_ready" THEN
+                        TPWrite "AMR car arrived signal received. Storing car2.";
+                        Store_Car2;
+                        SocketSend client_socket \Str := "car2_comp";
+                    ENDIF
+                received_msg := "";    
+            ENDIF
+            
+            IF nBlackTireCount >= 8 AND nWhiteTireCount >= 8 THEN
+                MoveJ p_home, v200, z50, tool_one;
+                TPWrite "Both containers are full. Waiting for AMR...";
+                SocketSend client_socket \Str := "recv_cont";
+                SocketReceive client_socket \Str := received_msg \Time := 99999;
+                
+                IF received_msg = "receive1_ready" THEN
+                    TPWrite "AMR has arrived. Releasing white containers...";
+                    stack_amr_white;
+                    SocketSend client_socket \Str := "white_con_give";
+                    
+                ENDIF
+                
+                SocketReceive client_socket \Str := received_msg \Time := 99999;
+                
+                    IF received_msg = "receive2_ready" THEN
+                        TPWrite "AMR has arrived. Releasing black containers...";
+                        stack_amr_black;
+                        SocketSend client_socket \Str := "black_con_give";
+                        
+                    ENDIF
+                
+                FOR i FROM 1 TO 8 DO
+                    nBlackTireCont{i} := 0;
+                    nWhiteTireCont{i} := 0;
+                ENDFOR
+                nBlackTireCount := 0;
+                nWhiteTireCount := 0;
+            ENDIF
+            
+            received_msg := "";
+            WaitTime 0.1;
+        ENDWHILE
+    ENDPROC
+
+ENDMODULE
