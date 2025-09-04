@@ -1,0 +1,521 @@
+from keras.models import load_model
+import cv2
+import numpy as np
+import socket
+import threading
+from collections import deque
+import time
+
+# --- 모델 및 라벨 불러오기 ---
+model = load_model("keras_Model.h5", compile=False)
+with open("labels.txt", "r", encoding="utf-8") as f:
+    class_names = [label.strip() for label in f.readlines()]
+
+# 웹캠 초기화
+webcam_active = True
+cap = cv2.VideoCapture(1)  # USB 외장 웹캠 인덱스 (필요시 변경)
+# webcam_active = False 웹캠 필요없을 시 위에 내용 주석처리 후 활성화
+# cap = None
+
+if not cap.isOpened():
+    print("❌ 웹캠을 열 수 없습니다.")
+    exit()
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# ===== 설정 =====
+SERVER_IP = "192.168.3.5"
+SERVER_PORT = 3000
+
+# ===== 전역 상태 =====
+lock = threading.Lock()
+clients = set()  # 생존 소켓 집합
+client_roles = {}
+cmd_queue = deque()  # 앱→ABB로 가는 지령 큐
+cmd_queue_abb = deque()    # ABB용 명령 큐
+cmd_queue_abb2 = deque()   # ABB2용 명령 큐
+current_words = []
+current_index = 0
+
+counts = {"BLACK": 0, "WHITE": 0, "BLUE": 0}
+frame_count = 0
+last_result = ("NONE", 0.0)
+
+previous_class = "NONE"
+class_sent = False
+
+# 2초 지연을 위한 변수
+detection_time = None
+# NONE 상태 이후 전송을 위한 플래그
+can_send_next = True
+
+# 역할 문자열 확장
+allowed_roles = {"ROLE_APP", "ROLE_ABB", "ROLE_ABB2", "ROLE_ARDUINO"}
+
+# ===== 유틸 =====
+def log(msg):
+    print(time.strftime("[%H:%M:%S] "), msg)
+
+def get_role(sock):
+    with lock:
+        return client_roles.get(sock, "UNKNOWN")
+
+def get_abbs():
+    with lock:
+        return [s for s, r in client_roles.items() if r == "ROLE_ABB"]
+
+def get_abb2s():
+    with lock:
+        return [s for s, r in client_roles.items() if r == "ROLE_ABB2"]
+
+def get_arduinos():
+    with lock:
+        return [s for s, r in client_roles.items() if r == "ROLE_ARDUINO"]
+
+def get_apps():
+    with lock:
+        return [s for s, r in client_roles.items() if r == "ROLE_APP"]
+
+def safe_send(sock, text):
+    try:
+        sock.send(text.encode())
+        return True
+    except socket.timeout:
+        print(f"❌ 전송 타임아웃 오류({get_role(sock)}): {text}")
+        return False
+    except Exception as e:
+        print(f"❌ 전송 오류({get_role(sock)}): {e}")
+        return False
+
+# ===== 추가된 함수: 문자열을 정해진 단어 기준으로 재귀적 분리 =====
+def split_message_by_words_recursive(message, word_list):
+    if not message:
+        return []  # 빈 문자열이면 분할 완료
+
+    for word in word_list:
+        if message.startswith(word):
+            rest = message[len(word):]
+            result_rest = split_message_by_words_recursive(rest, word_list)
+            if result_rest is not None:
+                return [word] + result_rest
+    return None
+
+# ===== 추가된 함수: ABB에 단어 순차 전송 =====
+def send_next_word():
+    global current_index, current_words
+    abb_socks = get_abbs()
+    with lock:
+        if current_index < len(current_words):
+            word = current_words[current_index]
+            for sock in abb_socks:
+                safe_send(sock, word)
+                print(f"✅ ABB에 전송: {word}")
+        else:
+            print("✅ 모든 단어 전송 완료")
+
+# ===== 메시지 처리 =====
+def handle_app_message(msg, sock):
+    global counts, current_words, current_index
+    msg = msg.strip()
+    colors = ["BASEBK", "BASEWH", "BODYWH", "BODYRD", "WHEELBK", "WHEELWH"]
+    with lock:
+        current_words = split_message_by_words_recursive(msg, sorted(colors, key=len, reverse=True))
+        current_index = 0
+    if current_words:
+        send_next_word()
+
+    if msg == "WHLSTRT":
+        with lock:
+            cmd_queue_abb2.append(msg)  # WHLSTRT는 ABB2 전용 큐
+        safe_send(sock, f"ACK {msg}")
+        print(f"✅ APP 명령 수신 → ABB2 큐 적재: {msg}")
+
+    elif msg in ("ASEMB1", "OTHER_CMD_FOR_ABB"):
+        with lock:
+            cmd_queue_abb.append(msg)  # 기타 신호는 ABB 큐
+        safe_send(sock, f"ACK {msg}")
+        print(f"✅ APP 명령 수신 → ABB 큐 적재: {msg}")
+
+    else:
+        safe_send(sock, f"NACK {msg}")
+        print(f"❌ APP 알 수 없는 명령: {msg}")
+
+def handle_abb_message(msg, sock):
+    global current_index, current_words
+    msg = msg.strip()
+    print(f"✅ ABB 메시지 수신: {msg}")
+
+    if msg == "C":  # ABB가 확인 메시지 보낼 때마다 다음 단어 전송
+        with lock:
+            if current_index < len(current_words):
+                current_index += 1
+                if current_index < len(current_words):
+                    send_next_word()
+                else:
+                    print("✅ ABB 모든 단어 전송 완료")
+
+    else:
+        # 아두이노 명령 큐에 ABB 메시지 추가
+        with lock:
+            cmd_queue.append(msg)
+        print(f"✅ ABB 메시지를 아두이노 큐에 추가: {msg}")
+
+def handle_abb2_message(msg, sock):
+    global webcam_active, cap
+    msg = msg.strip()
+    print(f"✅ ABB2 상태메시지 수신: {msg}")
+
+    with lock:
+        cmd_queue.append(msg)  # 모든 메시지를 아두이노 큐에 추가
+
+    if msg == "recv_cont":
+        print("🚩 분류 완료, 웹캠 종료")
+        if webcam_active:
+            cap.release()
+            webcam_active = False
+
+def handle_arduino_message(msg, sock):
+    msg = msg.strip()
+    print(f"✅ 아두이노 상태메시지 수신: {msg}")
+
+    abb2_msgs = [
+        "receive1_ready", "receive2_ready", "car1_ready", "car2_ready"
+    ]
+    abb_msgs = [
+        "give1_ready", "give2_ready", "car1_receive_ready", "car2_receive_ready"
+    ]
+
+    if msg in abb2_msgs:
+        for abb2 in get_abb2s():
+            safe_send(abb2, msg)
+            print(f"✅ ABB2로 메시지 전송: {msg}")
+
+    elif msg in abb_msgs:
+        for abb in get_abbs():
+            safe_send(abb, msg)
+            print(f"✅ ABB로 메시지 전송: {msg}")
+
+def flush_cmds_to_abb():
+    abbs = get_abbs()
+    if not abbs:
+        return
+    while True:
+        with lock:
+            if not cmd_queue_abb:
+                break
+            msg = cmd_queue_abb.popleft()
+        for abb in abbs:
+            ok = safe_send(abb, msg)
+            if ok:
+                print(f"✅ 큐→ABB 전송: {msg}")
+
+def flush_cmds_to_abb2():
+    abb2s = get_abb2s()
+    if not abb2s:
+        return
+    while True:
+        with lock:
+            if not cmd_queue_abb2:
+                break
+            msg = cmd_queue_abb2.popleft()
+        for abb2 in abb2s:
+            ok = safe_send(abb2, msg)
+            if ok:
+                print(f"✅ 큐→ABB2 전송: {msg}")
+
+def flush_cmds_to_arduino():
+    arduinos = get_arduinos()
+    if not arduinos:
+        return
+    while True:
+        with lock:
+            if not cmd_queue:
+                break
+            msg = cmd_queue.popleft()
+        for arduino in arduinos:
+            ok = safe_send(arduino, msg)
+            if ok:
+                print(f"✅ 큐→ARDUINO 전송: {msg}")
+            else:
+                print(f"❌ 큐→ARDUINO 전송 실패: {msg}")
+
+def manual_send_input():
+    while True:
+        try:
+            print("\n=== 연결된 클라이언트 목록 ===")
+            with lock:
+                for i, sock in enumerate(clients):
+                    role = client_roles.get(sock, "UNKNOWN")
+                    print(f"[{i}] {role} {sock.getpeername()}")
+
+            idx = input("전송할 클라이언트 번호 입력 (취소: 빈 엔터): ").strip()
+            if idx == "":
+                continue
+            try:
+                idx = int(idx)
+            except ValueError:
+                print("번호를 입력해야 합니다.")
+                continue
+
+            with lock:
+                sock_list = list(clients)
+                if idx < 0 or idx >= len(sock_list):
+                    print("잘못된 번호입니다.")
+                    continue
+                target_sock = sock_list[idx]
+                role = client_roles.get(target_sock, "UNKNOWN")
+
+            msg = input(f"보낼 메시지 입력 (클라이언트 {role}): ").strip()
+            if msg == "":
+                print("빈 메시지, 취소.")
+                continue
+
+            sent = safe_send(target_sock, msg)
+            if sent:
+                print(f"✅ {role} 클라이언트에 '{msg}' 전송 완료")
+            else:
+                print(f"❌ 전송 실패")
+        except Exception as e:
+            print(f"❌ manual_send_input 오류: {e}")
+
+def client_thread(sock, addr):
+    print(f"✅ 클라이언트 연결됨: {addr}")
+    with lock:
+        clients.add(sock)
+
+    buffered_data = ""
+
+    try:
+        sock.settimeout(5.0)
+        first = sock.recv(1024)
+        sock.settimeout(1.0)
+    except Exception as e:
+        print(f"❌ 초기 수신 실패({addr}): {e}")
+        first = b""
+
+    role_msg = first.decode().strip() if first else ""
+    if role_msg in allowed_roles:
+        with lock:
+            client_roles[sock] = role_msg
+        print(f"클라이언트 {addr} 역할 등록: {role_msg}")
+    else:
+        print(f"❌ 클라이언트 {addr} 역할 미명시 또는 알 수 없음 (첫메시지='{role_msg}') - 연결 종료")
+        try:
+            sock.send("ERROR: 역할 미지정 또는 알 수 없는 역할입니다.\n".encode())
+        except:
+            pass
+        sock.close()
+        return
+
+    try:
+        sock.settimeout(0.05)
+        while True:
+            flush_cmds_to_abb()
+            flush_cmds_to_abb2()
+            flush_cmds_to_arduino()
+            try:
+                data = sock.recv(1024)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+
+            buffered_data += data.decode()
+
+            msg = buffered_data.strip()
+            buffered_data = ""
+
+            if not msg:
+                continue
+
+            role = get_role(sock)
+
+            if role == "ROLE_APP":
+                if msg.startswith("ACK"):
+                    print(f"✅ APP로부터 응답 수신: {msg}")
+                else:
+                    colors = ["BASEBK", "BASEWH", "BODYWH", "BODYRD", "WHEELBK", "WHEELWH"]
+                    split_result = split_message_by_words_recursive(msg, sorted(colors, key=len, reverse=True))
+                    if split_result is None:
+                        print(f"❌ APP 알 수 없는 명령: {msg}")
+                        safe_send(sock, f"NACK {msg}")
+                    else:
+                        with lock:
+                            current_words = split_result
+                            current_index = 0
+                        if current_words:
+                            send_next_word()
+                        if msg == "WHLSTRT":
+                            with lock:
+                                cmd_queue_abb2.append(msg)
+                            safe_send(sock, f"ACK {msg}")
+                            print(f"✅ APP 명령 수신 → ABB2 큐 적재: {msg}")
+
+                        elif msg in ("ASEMB1", "OTHER_CMD_FOR_ABB"):
+                            with lock:
+                                cmd_queue_abb.append(msg)
+                            safe_send(sock, f"ACK {msg}")
+                            print(f"✅ APP 명령 수신 → ABB 큐 적재: {msg}")
+
+                        else:
+                            pass
+
+            elif role == "ROLE_ABB":
+                if msg.startswith("ACK"):
+                    print(f"✅ ABB로부터 응답 수신: {msg}")
+                else:
+                    handle_abb_message(msg, sock)
+
+            elif role == "ROLE_ABB2":
+                if msg.startswith("ACK"):
+                    print(f"✅ ABB2로부터 응답 수신: {msg}")
+                else:
+                    handle_abb2_message(msg, sock)
+
+            elif role == "ROLE_ARDUINO":
+                if msg.startswith("ACK"):
+                    print(f"✅ 아두이노로부터 응답 수신: {msg}")
+                else:
+                    handle_arduino_message(msg, sock)
+            else:
+                print(f"❌ UNKNOWN 역할 수신({addr}): {msg}")
+
+    except Exception as e:
+        print(f"❌ 클라이언트 오류({addr}): {e}")
+    finally:
+        with lock:
+            clients.discard(sock)
+            client_roles.pop(sock, None)
+        try:
+            sock.close()
+        except:
+            pass
+        print(f"클라이언트 연결 종료: {addr}")
+
+def accept_loop(srv):
+    while True:
+        cs, addr = srv.accept()
+        t = threading.Thread(target=client_thread, args=(cs, addr), daemon=True)
+        t.start()
+
+def main():
+    global frame_count, last_result, previous_class, class_sent
+    global detection_time, can_send_next, counts
+    global cap, webcam_active
+
+    failure_count = 0
+    max_failures = 10
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((SERVER_IP, SERVER_PORT))
+    srv.listen(5)
+    print(f"✅ 서버 소켓 시작, {SERVER_IP}:{SERVER_PORT} 클라이언트 접속 대기 중...")
+
+    threading.Thread(target=accept_loop, args=(srv,), daemon=True).start()
+    threading.Thread(target=manual_send_input, daemon=True).start()
+
+    while True:
+        if webcam_active:
+            ret, image = cap.read()
+            if not ret:
+                failure_count += 1
+                print(f"⚠️ 프레임 읽기 실패 {failure_count}회")
+                if failure_count >= max_failures:
+                    print("🔄 카메라 재초기화 시도")
+                    cap.release()
+                    time.sleep(2)
+                    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+                    failure_count = 0
+                continue
+            else:
+                failure_count = 0
+
+            h, w, _ = image.shape
+            roi_size = 100
+            x1 = int(w * 0.43)
+            y1 = int(h * 0.58) - roi_size
+            x2 = x1 + roi_size
+            y2 = y1 + roi_size
+            roi = image[y1:y2, x1:x2]
+
+            frame_count += 1
+            resized_for_model = cv2.resize(roi, (224, 224), interpolation=cv2.INTER_AREA)
+            norm = (np.asarray(resized_for_model, dtype=np.float32).reshape(1, 224, 224, 3) / 127.5) - 1
+
+            if frame_count % 15 == 0:
+                prediction = model.predict(norm, verbose=0)
+                index = np.argmax(prediction)
+                class_name = class_names[index]
+                confidence_score = float(prediction[0][index])
+                last_result = (class_name, confidence_score)
+            else:
+                class_name, confidence_score = last_result
+
+            text = f"Detected: {class_name} ({confidence_score * 100:.1f}%)"
+            cv2.putText(image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+            if class_name == "NONE":
+                with lock:
+                    can_send_next = True
+                    detection_time = None
+
+            if can_send_next:
+                should_send = False
+                if class_name in ["BLACK", "WHITE"] and confidence_score > 0.8:
+                    should_send = True
+                elif class_name == "BLUE" and confidence_score > 0.5:
+                    should_send = True
+
+                if should_send:
+                    abb2s = get_abb2s()
+                    apps = get_apps()
+
+                    if detection_time is None:
+                        detection_time = time.time()
+
+                    elif time.time() - detection_time >= 2.0:
+
+                        for abb2 in abb2s:
+                            sent = safe_send(abb2, class_name)
+                            if sent:
+                                print(f"✅ ABB2로 색상 '{class_name}' 메시지 전송 (2초 지연)")
+
+                        for app in apps:
+                            sent = safe_send(app, class_name)
+                            if sent:
+                                print(f"✅ APP으로 색상 '{class_name}' 메시지 전송")
+
+                        with lock:
+                            can_send_next = False
+                            previous_class = class_name
+                            detection_time = None
+
+            cv2.imshow("Webcam Image", image)
+
+        else:
+            cv2.destroyAllWindows()
+
+        flush_cmds_to_abb()
+        flush_cmds_to_abb2()
+        flush_cmds_to_arduino()
+
+        key = cv2.waitKey(10)
+        if key == 27:
+            print("🛑 사용자 종료")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    with lock:
+        for s in list(clients):
+            try:
+                s.close()
+            except:
+                pass
+    srv.close()
+
+if __name__ == "__main__":
+    main()
